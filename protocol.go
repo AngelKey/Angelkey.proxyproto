@@ -3,6 +3,7 @@ package proxyproto
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -30,6 +31,7 @@ var (
 type Listener struct {
 	Listener           net.Listener
 	ProxyHeaderTimeout time.Duration
+	TLSConfig          *tls.Config
 }
 
 // Conn is used to wrap and underlying connection which
@@ -42,6 +44,7 @@ type Conn struct {
 	srcAddr            *net.TCPAddr
 	once               sync.Once
 	proxyHeaderTimeout time.Duration
+	tlsConfig          *tls.Config
 }
 
 // Accept waits for and returns the next connection to the listener.
@@ -51,7 +54,7 @@ func (p *Listener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewConn(conn, p.ProxyHeaderTimeout), nil
+	return NewConn(conn, p.ProxyHeaderTimeout, p.TLSConfig), nil
 }
 
 // Close closes the underlying listener.
@@ -66,11 +69,12 @@ func (p *Listener) Addr() net.Addr {
 
 // NewConn is used to wrap a net.Conn that may be speaking
 // the proxy protocol into a proxyproto.Conn
-func NewConn(conn net.Conn, timeout time.Duration) *Conn {
+func NewConn(conn net.Conn, timeout time.Duration, tlsConfig *tls.Config) *Conn {
 	pConn := &Conn{
 		bufReader:          bufio.NewReader(conn),
 		conn:               conn,
 		proxyHeaderTimeout: timeout,
+		tlsConfig:          tlsConfig,
 	}
 	return pConn
 }
@@ -132,11 +136,17 @@ func (p *Conn) SetWriteDeadline(t time.Time) error {
 	return p.conn.SetWriteDeadline(t)
 }
 
-func (p *Conn) checkPrefix() error {
+func (p *Conn) checkPrefix() (err error) {
 	if p.proxyHeaderTimeout != 0 {
 		readDeadLine := time.Now().Add(p.proxyHeaderTimeout)
 		p.conn.SetReadDeadline(readDeadLine)
 		defer p.conn.SetReadDeadline(time.Time{})
+		defer func() {
+			// If we have no error, and a TLS config was specified, treat this conn as a TLS conn
+			if p.tlsConfig != nil {
+				p.conn = tls.Server(p.conn, p.tlsConfig)
+			}
+		}()
 	}
 
 	// Incrementally check each byte of the prefix
