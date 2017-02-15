@@ -21,6 +21,31 @@ var (
 	prefixLen = len(prefix)
 )
 
+// rewindConn is used to playback bytes we read during probing for the PROXY header
+type rewindConn struct {
+	net.Conn
+	peekBuffer *bytes.Reader
+}
+
+func newRewindConn(conn net.Conn, peekBuffer *bytes.Reader) *rewindConn {
+	return &rewindConn{
+		peekBuffer: peekBuffer,
+		Conn:       conn,
+	}
+}
+
+func (p *rewindConn) Read(target []byte) (int, error) {
+	if p.peekBuffer != nil {
+		// If we have a peekBuffer around, read as much as we can from it. If we have read everything,
+		// this read will trigger EOF and we will fall through to the base connection
+		rb, err := p.peekBuffer.Read(target)
+		if err == nil {
+			return rb, nil
+		}
+	}
+	return p.Conn.Read(target)
+}
+
 // Listener is used to wrap an underlying listener,
 // whose connections may be using the HAProxy Proxy Protocol (version 1).
 // If the connection is using the protocol, the RemoteAddr() will return
@@ -38,7 +63,6 @@ type Listener struct {
 // may be speaking the Proxy Protocol. If it is, the RemoteAddr() will
 // return the address of the client instead of the proxy address.
 type Conn struct {
-	bufReader          *bufio.Reader
 	conn               net.Conn
 	dstAddr            *net.TCPAddr
 	srcAddr            *net.TCPAddr
@@ -71,7 +95,6 @@ func (p *Listener) Addr() net.Addr {
 // the proxy protocol into a proxyproto.Conn
 func NewConn(conn net.Conn, timeout time.Duration, tlsConfig *tls.Config) *Conn {
 	pConn := &Conn{
-		bufReader:          bufio.NewReader(conn),
 		conn:               conn,
 		proxyHeaderTimeout: timeout,
 		tlsConfig:          tlsConfig,
@@ -82,13 +105,13 @@ func NewConn(conn net.Conn, timeout time.Duration, tlsConfig *tls.Config) *Conn 
 // Read is check for the proxy protocol header when doing
 // the initial scan. If there is an error parsing the header,
 // it is returned and the socket is closed.
-func (p *Conn) Read(b []byte) (int, error) {
+func (p *Conn) Read(target []byte) (int, error) {
 	var err error
 	p.once.Do(func() { err = p.checkPrefix() })
 	if err != nil {
 		return 0, err
 	}
-	return p.bufReader.Read(b)
+	return p.conn.Read(target)
 }
 
 func (p *Conn) Write(b []byte) (int, error) {
@@ -115,7 +138,6 @@ func (p *Conn) RemoteAddr() net.Addr {
 		if err := p.checkPrefix(); err != nil && err != io.EOF {
 			log.Printf("[ERR] Failed to read proxy prefix: %v", err)
 			p.Close()
-			p.bufReader = bufio.NewReader(p.conn)
 		}
 	})
 	if p.srcAddr != nil {
@@ -137,42 +159,77 @@ func (p *Conn) SetWriteDeadline(t time.Time) error {
 }
 
 func (p *Conn) checkPrefix() (err error) {
+	var peekBytes []byte
+	var bufReader *bufio.Reader
+
 	if p.proxyHeaderTimeout != 0 {
 		readDeadLine := time.Now().Add(p.proxyHeaderTimeout)
 		p.conn.SetReadDeadline(readDeadLine)
 		defer p.conn.SetReadDeadline(time.Time{})
 		defer func() {
-			// If we have no error, and a TLS config was specified, treat this conn as a TLS conn
-			if p.tlsConfig != nil {
-				p.conn = tls.Server(p.conn, p.tlsConfig)
+			if err == nil {
+				conn := p.conn
+
+				// If there are any leftover bytes that we have read, make sure to load them
+				// into a rewindConn so we can play them back on the next read
+				if len(peekBytes) > 0 || bufReader.Buffered() > 0 {
+					// If the buffered reader has bytes left that it read but didn't consume,
+					// we need to replay those
+					if bufReader.Buffered() > 0 {
+						buffered := make([]byte, bufReader.Buffered())
+						_, err = bufReader.Read(buffered)
+						if err != nil {
+							return
+						}
+						peekBytes = append(peekBytes, buffered...)
+					}
+					conn = newRewindConn(conn, bytes.NewReader(peekBytes))
+				}
+
+				if p.tlsConfig != nil {
+					// If we have no error, and a TLS config was specified, treat this conn as a TLS conn
+					p.conn = tls.Server(conn, p.tlsConfig)
+				} else {
+					p.conn = conn
+				}
 			}
 		}()
 	}
 
 	// Incrementally check each byte of the prefix
-	for i := 1; i <= prefixLen; i++ {
-		inp, err := p.bufReader.Peek(i)
-
+	bufReader = bufio.NewReader(p.conn)
+	singleByte := make([]byte, 1)
+	for i := 0; i < prefixLen; i++ {
+		_, err := bufReader.Read(singleByte)
 		if err != nil {
 			if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 				return nil
-			} else {
-				return err
 			}
+			return err
 		}
+		peekBytes = append(peekBytes, singleByte[0])
 
-		// Check for a prefix mis-match, quit early
-		if !bytes.Equal(inp, prefix[:i]) {
+		// Check for a prefix mis-match, quit early. Note that peekBytes will not be set to nil,
+		// and so we will be creating a rewindConn from it above.
+		if singleByte[0] != prefix[i] {
 			return nil
 		}
 	}
 
+	// Copy out peek bytes and set to nil, we will be reading now and any errors from this
+	// point on fail the connection (so we want the bytes to not be read by clients, we are
+	// processing the PROXY header now)
+	line := make([]byte, len(peekBytes))
+	copy(line, peekBytes)
+	peekBytes = nil
+
 	// Read the header line
-	header, err := p.bufReader.ReadString('\n')
+	header, err := bufReader.ReadString('\n')
 	if err != nil {
 		p.conn.Close()
 		return err
 	}
+	header = string(line[:]) + header
 
 	// Strip the carriage return and new line
 	header = header[:len(header)-2]
