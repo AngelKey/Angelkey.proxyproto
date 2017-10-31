@@ -57,6 +57,7 @@ type Listener struct {
 	Listener           net.Listener
 	ProxyHeaderTimeout time.Duration
 	TLSConfig          *tls.Config
+	SrcIPFoundCb       func(net.Addr)
 }
 
 // Conn is used to wrap and underlying connection which
@@ -69,6 +70,7 @@ type Conn struct {
 	once               sync.Once
 	proxyHeaderTimeout time.Duration
 	tlsConfig          *tls.Config
+	srcIPFoundCb       func(net.Addr)
 }
 
 // Accept waits for and returns the next connection to the listener.
@@ -78,7 +80,7 @@ func (p *Listener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewConn(conn, p.ProxyHeaderTimeout, p.TLSConfig), nil
+	return NewConn(conn, p.ProxyHeaderTimeout, p.TLSConfig, p.SrcIPFoundCb), nil
 }
 
 // Close closes the underlying listener.
@@ -93,11 +95,13 @@ func (p *Listener) Addr() net.Addr {
 
 // NewConn is used to wrap a net.Conn that may be speaking
 // the proxy protocol into a proxyproto.Conn
-func NewConn(conn net.Conn, timeout time.Duration, tlsConfig *tls.Config) *Conn {
+func NewConn(conn net.Conn, timeout time.Duration, tlsConfig *tls.Config,
+	srcIPFoundCb func(net.Addr)) *Conn {
 	pConn := &Conn{
 		conn:               conn,
 		proxyHeaderTimeout: timeout,
 		tlsConfig:          tlsConfig,
+		srcIPFoundCb:       srcIPFoundCb,
 	}
 	return pConn
 }
@@ -262,6 +266,9 @@ func (p *Conn) checkPrefix() (err error) {
 		return fmt.Errorf("Invalid source port: %s", parts[4])
 	}
 	p.srcAddr = &net.TCPAddr{IP: ip, Port: port}
+	if p.srcIPFoundCb != nil {
+		p.srcIPFoundCb(p.srcAddr)
+	}
 
 	// Parse out the destination address
 	ip = net.ParseIP(parts[3])
